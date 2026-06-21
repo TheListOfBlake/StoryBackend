@@ -22,6 +22,18 @@ FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "")
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "")
 PBKDF2_ROUNDS = int(os.environ.get("PBKDF2_ROUNDS", "200000"))
 DB_PATH = os.environ.get("AUTH_DB_PATH", str(Path(__file__).resolve().parent / "data" / "app.db"))
+ADMIN_USERNAME = (
+  os.environ.get("ADMIN_USERNAME")
+  or os.environ.get("ADMIN_USER")
+  or os.environ.get("VITE_ADMIN_USER")
+  or ""
+).strip()
+ADMIN_PASSWORD = (
+  os.environ.get("ADMIN_PASSWORD")
+  or os.environ.get("ADMIN_PASS")
+  or os.environ.get("VITE_ADMIN_PASS")
+  or ""
+)
 
 app = FastAPI()
 
@@ -168,6 +180,16 @@ def create_user(username: str, password: str) -> None:
     conn.commit()
 
 
+def has_env_admin() -> bool:
+  return bool(ADMIN_USERNAME and ADMIN_PASSWORD)
+
+
+def verify_env_admin(username: str, password: str) -> bool:
+  if not has_env_admin():
+    return False
+  return hmac.compare_digest(username.strip(), ADMIN_USERNAME) and hmac.compare_digest(password or "", ADMIN_PASSWORD)
+
+
 def require_admin(request: Request) -> str:
   username = request.session.get("username")
   if not username:
@@ -192,7 +214,7 @@ async def auth_me(request: Request):
 async def auth_status(request: Request):
   username = request.session.get("username")
   return {
-    "setup_required": count_users() == 0,
+    "setup_required": False if has_env_admin() else count_users() == 0,
     "authenticated": bool(username),
     "username": username or "",
   }
@@ -214,6 +236,12 @@ async def auth_setup_admin(payload: AuthRequest, request: Request):
 
 @app.post("/auth/login")
 async def auth_login(payload: AuthRequest, request: Request):
+  if has_env_admin():
+    if not verify_env_admin(payload.username or "", payload.password or ""):
+      raise HTTPException(status_code=401, detail="Invalid username or password")
+    request.session["username"] = ADMIN_USERNAME
+    return {"ok": True, "username": ADMIN_USERNAME}
+
   user = get_user((payload.username or "").strip())
   if not user:
     raise HTTPException(status_code=401, detail="Invalid username or password")
