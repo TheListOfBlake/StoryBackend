@@ -7,12 +7,14 @@ import hmac
 import os
 import secrets
 import sqlite3
+import smtplib
 import subprocess
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,6 +44,12 @@ ADMIN_PASSWORD = (
   or ""
 )
 PAYMENT_CONFIG_SECRET = os.environ.get("PAYMENT_CONFIG_SECRET", "")
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME).strip()
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Storytime Captions").strip()
 
 app = FastAPI()
 
@@ -63,6 +71,9 @@ def parse_bool_env(name: str, default: bool) -> bool:
   if value in {"0", "false", "no", "off"}:
     return False
   return default
+
+
+SMTP_USE_TLS = parse_bool_env("SMTP_USE_TLS", True)
 
 
 def is_local_origin(origin: str) -> bool:
@@ -562,6 +573,89 @@ def get_template_by_slug(slug: str):
     return conn.execute("SELECT * FROM template_products WHERE slug = ?", (slug,)).fetchone()
 
 
+def month_pack_sort_key(row: sqlite3.Row) -> int:
+  slug = str(row["slug"])
+  parts = slug.split("-")
+  for part in parts:
+    if part.isdigit():
+      return int(part)
+  return 999
+
+
+def get_template_download_links(product_slug: str) -> List[dict]:
+  clean_slug = normalize_template_slug(product_slug)
+  with get_db_conn() as conn:
+    if clean_slug == "full-12-month-pack":
+      rows = conn.execute(
+        """
+        SELECT name, slug, r2_download_url FROM template_products
+        WHERE slug LIKE 'month-%-pack' AND active = 1 AND r2_download_url != ''
+        """
+      ).fetchall()
+      return [
+        {"name": row["name"], "url": row["r2_download_url"]}
+        for row in sorted(rows, key=month_pack_sort_key)
+      ]
+
+    row = conn.execute(
+      "SELECT name, slug, r2_download_url FROM template_products WHERE slug = ? AND active = 1",
+      (clean_slug,),
+    ).fetchone()
+  if not row or not row["r2_download_url"]:
+    return []
+  return [{"name": row["name"], "url": row["r2_download_url"]}]
+
+
+def send_template_download_email(product_slug: str, email: str) -> None:
+  if not SMTP_HOST or not SMTP_FROM_EMAIL:
+    return
+
+  links = get_template_download_links(product_slug)
+  if not links:
+    return
+
+  clean_email = email.strip().lower()
+  product = get_template_by_slug(product_slug)
+  product_name = product["name"] if product else "Storytime Template Pack"
+  lines = [
+    "Thanks for your purchase.",
+    "",
+    f"Your {product_name} download link{'s are' if len(links) > 1 else ' is'} below:",
+    "",
+  ]
+  for link in links:
+    lines.append(f"{link['name']}: {link['url']}")
+  lines.extend(
+    [
+      "",
+      "If you have trouble downloading, reply to this email with your purchase email.",
+      "",
+      "Storytime Captions",
+    ]
+  )
+
+  message = EmailMessage()
+  message["Subject"] = f"Your {product_name} download"
+  message["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>"
+  message["To"] = clean_email
+  message.set_content("\n".join(lines))
+
+  try:
+    if SMTP_USE_TLS:
+      with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        smtp.starttls()
+        if SMTP_USERNAME and SMTP_PASSWORD:
+          smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(message)
+    else:
+      with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+        if SMTP_USERNAME and SMTP_PASSWORD:
+          smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(message)
+  except (OSError, smtplib.SMTPException):
+    return
+
+
 def extract_nested_value(data: Dict, paths: List[List[str]]) -> str:
   for path in paths:
     current = data
@@ -587,7 +681,7 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
   if not get_template_by_slug(clean_slug):
     raise HTTPException(status_code=400, detail="Webhook referenced an unknown template")
   with get_db_conn() as conn:
-    conn.execute(
+    cursor = conn.execute(
       """
       INSERT OR IGNORE INTO template_purchases (
         provider, provider_event_id, provider_payment_id, product_slug, customer_email, raw_event
@@ -596,6 +690,8 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
       (provider, event_id, payment_id or "", clean_slug, clean_email, json.dumps(raw_event)),
     )
     conn.commit()
+  if cursor.rowcount > 0:
+    send_template_download_email(clean_slug, clean_email)
 
 
 def verify_stripe_signature(raw_body: bytes, signature_header: str) -> None:
@@ -923,13 +1019,13 @@ async def get_template_download(payload: TemplateDownloadRequest):
     ).fetchone()
     if not purchase:
       raise HTTPException(status_code=404, detail="No completed purchase found for that email")
-    product = conn.execute(
-      "SELECT r2_download_url FROM template_products WHERE slug = ? AND active = 1",
-      (product_slug,),
-    ).fetchone()
-  if not product or not product["r2_download_url"]:
+  links = get_template_download_links(product_slug)
+  if not links:
     raise HTTPException(status_code=404, detail="Download is not configured yet")
-  return {"download_url": product["r2_download_url"]}
+  response = {"download_links": links}
+  if len(links) == 1:
+    response["download_url"] = links[0]["url"]
+  return response
 
 
 @app.post("/webhooks/stripe")
