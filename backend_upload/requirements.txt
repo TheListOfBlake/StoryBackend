@@ -3,3 +3,4 @@ uvicorn==0.30.6
 vosk==0.3.45
 python-multipart==0.0.9
 itsdangerous==2.2.0
+cryptography==43.0.3

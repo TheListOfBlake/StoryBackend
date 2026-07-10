@@ -1,4 +1,7 @@
+﻿from __future__ import annotations
+
 import json
+import base64
 import hashlib
 import hmac
 import os
@@ -6,12 +9,16 @@ import secrets
 import sqlite3
 import subprocess
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 from vosk import KaldiRecognizer, Model
@@ -34,6 +41,7 @@ ADMIN_PASSWORD = (
   or os.environ.get("VITE_ADMIN_PASS")
   or ""
 )
+PAYMENT_CONFIG_SECRET = os.environ.get("PAYMENT_CONFIG_SECRET", "")
 
 app = FastAPI()
 
@@ -119,12 +127,69 @@ class TemplateProduct(BaseModel):
 
 
 class TemplateBulkUpdate(BaseModel):
-  products: list[TemplateProduct]
+  products: List[TemplateProduct]
 
 
 class TemplateDownloadRequest(BaseModel):
   product_slug: str
   email: str
+
+
+class TemplateCheckoutRequest(BaseModel):
+  product_slug: str
+  customer_first_name: str = ""
+  customer_last_name: str = ""
+  customer_email: str = ""
+  success_url: str
+  cancel_url: str
+
+
+class PaymentSettingsUpdate(BaseModel):
+  stripe_secret_key: Optional[str] = None
+  stripe_webhook_secret: Optional[str] = None
+  paypal_client_id: Optional[str] = None
+  paypal_client_secret: Optional[str] = None
+  paypal_webhook_id: Optional[str] = None
+
+
+PAYMENT_SETTING_KEYS = {
+  "stripe_secret_key",
+  "stripe_webhook_secret",
+  "paypal_client_id",
+  "paypal_client_secret",
+  "paypal_webhook_id",
+}
+
+
+DEFAULT_TEMPLATE_PRODUCTS = [
+  {
+    "slug": "free-pack",
+    "name": "Free Pack",
+    "description": "Starter story template pack.",
+    "old_price": "",
+    "price": "Free",
+    "badge": "Free starter pack",
+  },
+  {
+    "slug": "full-12-month-pack",
+    "name": "Full 12 Month Pack",
+    "description": "Commercial use template bundle with 12 monthly packs.",
+    "old_price": "$179.99",
+    "price": "$99.99",
+    "badge": "Save 44% • Instant Download • Commercial Use • 12 Monthly Packs",
+  },
+  *[
+    {
+      "slug": f"month-{index}-pack",
+      "name": f"Month {index} Pack",
+      "description": "Monthly story template pack.",
+      "old_price": "",
+      "price": "$14.99",
+      "badge": "Instant Download • Commercial Use",
+    }
+    for index in range(1, 13)
+  ],
+]
 
 
 def get_db_conn() -> sqlite3.Connection:
@@ -192,6 +257,34 @@ def init_db() -> None:
       )
       """
     )
+    conn.execute(
+      """
+      CREATE TABLE IF NOT EXISTS payment_settings (
+        key TEXT PRIMARY KEY,
+        encrypted_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+      """
+    )
+    row = conn.execute("SELECT COUNT(*) AS count FROM template_products").fetchone()
+    if row and int(row["count"]) == 0:
+      for sort_order, product in enumerate(DEFAULT_TEMPLATE_PRODUCTS):
+        conn.execute(
+          """
+          INSERT INTO template_products (
+            slug, name, description, old_price, price, badge, sort_order
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          """,
+          (
+            product["slug"],
+            product["name"],
+            product["description"],
+            product["old_price"],
+            product["price"],
+            product["badge"],
+            sort_order,
+          ),
+        )
     conn.commit()
 
 
@@ -263,6 +356,164 @@ def require_admin_access_key(access_key: Optional[str]) -> None:
     raise HTTPException(status_code=403, detail="Invalid admin access key")
 
 
+def get_payment_cipher() -> Fernet:
+  secret = PAYMENT_CONFIG_SECRET.strip()
+  if len(secret) < 32:
+    raise HTTPException(
+      status_code=500,
+      detail="PAYMENT_CONFIG_SECRET must be set to a long random value before saving payment settings",
+    )
+  key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+  return Fernet(key)
+
+
+def encrypt_payment_value(value: str) -> str:
+  clean = (value or "").strip()
+  if not clean:
+    raise HTTPException(status_code=400, detail="Payment setting value cannot be empty")
+  return get_payment_cipher().encrypt(clean.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_payment_value(encrypted_value: str) -> str:
+  try:
+    return get_payment_cipher().decrypt(encrypted_value.encode("utf-8")).decode("utf-8")
+  except InvalidToken:
+    raise HTTPException(status_code=500, detail="Unable to decrypt payment settings with the configured secret")
+
+
+def mask_secret_value(value: str) -> str:
+  clean = (value or "").strip()
+  if not clean:
+    return ""
+  if len(clean) <= 8:
+    return "•" * len(clean)
+  return f"{clean[:4]}{'•' * 8}{clean[-4:]}"
+
+
+def serialize_payment_setting(key: str, encrypted_value: Optional[str], updated_at: Optional[str]) -> dict:
+  if not encrypted_value:
+    return {"key": key, "configured": False, "masked_value": "", "updated_at": ""}
+  value = decrypt_payment_value(encrypted_value)
+  return {
+    "key": key,
+    "configured": True,
+    "masked_value": mask_secret_value(value),
+    "updated_at": updated_at or "",
+  }
+
+
+def get_payment_setting_value(key: str) -> str:
+  if key not in PAYMENT_SETTING_KEYS:
+    return ""
+  with get_db_conn() as conn:
+    row = conn.execute("SELECT encrypted_value FROM payment_settings WHERE key = ?", (key,)).fetchone()
+  if not row:
+    return ""
+  return decrypt_payment_value(row["encrypted_value"]).strip()
+
+
+def get_stripe_secret_key() -> str:
+  saved = get_payment_setting_value("stripe_secret_key")
+  return saved or (os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+
+
+def get_stripe_webhook_secret() -> str:
+  saved = get_payment_setting_value("stripe_webhook_secret")
+  return saved or (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
+
+
+def parse_price_cents(price: str) -> int:
+  clean = (price or "").strip().replace("$", "").replace(",", "")
+  try:
+    amount = round(float(clean) * 100)
+  except ValueError:
+    raise HTTPException(status_code=400, detail="Product price must be a dollar amount like $14.99")
+  if amount < 50:
+    raise HTTPException(status_code=400, detail="Product price is too low for checkout")
+  return int(amount)
+
+
+def validate_checkout_url(value: str, fallback_origin: str) -> str:
+  clean = (value or "").strip()
+  parsed = urllib.parse.urlparse(clean)
+  if parsed.scheme in {"http", "https"} and parsed.netloc:
+    return clean
+  if fallback_origin:
+    origin = fallback_origin.rstrip("/")
+    return f"{origin}/"
+  raise HTTPException(status_code=400, detail="A valid checkout return URL is required")
+
+
+def stripe_checkout_session(
+  product: sqlite3.Row,
+  success_url: str,
+  cancel_url: str,
+  customer_first_name: str = "",
+  customer_last_name: str = "",
+  customer_email: str = "",
+) -> str:
+  secret_key = get_stripe_secret_key()
+  if not secret_key:
+    raise HTTPException(status_code=500, detail="Stripe secret key is not configured")
+
+  product_slug = product["slug"]
+  first_name = customer_first_name.strip()
+  last_name = customer_last_name.strip()
+  customer_name = " ".join(part for part in [first_name, last_name] if part)
+  if not first_name:
+    raise HTTPException(status_code=400, detail="First name is required")
+  data = {
+    "mode": "payment",
+    "success_url": success_url,
+    "cancel_url": cancel_url,
+    "payment_method_types[0]": "card",
+    "customer_creation": "if_required",
+    "line_items[0][quantity]": "1",
+    "line_items[0][price_data][currency]": "usd",
+    "line_items[0][price_data][unit_amount]": str(parse_price_cents(product["price"])),
+    "line_items[0][price_data][product_data][name]": product["name"],
+    "line_items[0][price_data][product_data][description]": product["description"] or product["badge"] or product["name"],
+    "line_items[0][price_data][product_data][metadata][template_slug]": product_slug,
+    "metadata[template_slug]": product_slug,
+    "metadata[customer_name]": customer_name.strip(),
+    "payment_intent_data[metadata][template_slug]": product_slug,
+    "payment_intent_data[metadata][customer_name]": customer_name.strip(),
+  }
+  clean_email = customer_email.strip().lower()
+  if clean_email:
+    if "@" not in clean_email:
+      raise HTTPException(status_code=400, detail="Enter a valid email address")
+    data["customer_email"] = clean_email
+  encoded = urllib.parse.urlencode(data).encode("utf-8")
+  request = urllib.request.Request(
+    "https://api.stripe.com/v1/checkout/sessions",
+    data=encoded,
+    headers={
+      "Authorization": f"Bearer {secret_key}",
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    method="POST",
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+      payload = json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as exc:
+    error_body = exc.read().decode("utf-8", errors="ignore")
+    try:
+      error_payload = json.loads(error_body)
+      message = error_payload.get("error", {}).get("message") or "Stripe rejected the checkout request"
+    except json.JSONDecodeError:
+      message = "Stripe rejected the checkout request"
+    raise HTTPException(status_code=502, detail=message)
+  except urllib.error.URLError:
+    raise HTTPException(status_code=502, detail="Unable to reach Stripe checkout service")
+
+  checkout_url = payload.get("url")
+  if not checkout_url:
+    raise HTTPException(status_code=502, detail="Stripe did not return a checkout URL")
+  return str(checkout_url)
+
+
 def normalize_template_slug(value: str) -> str:
   clean = "".join(ch.lower() if ch.isalnum() else "-" for ch in (value or "").strip())
   clean = "-".join(part for part in clean.split("-") if part)
@@ -294,7 +545,7 @@ def get_template_by_slug(slug: str):
     return conn.execute("SELECT * FROM template_products WHERE slug = ?", (slug,)).fetchone()
 
 
-def extract_nested_value(data: dict, paths: list[list[str]]) -> str:
+def extract_nested_value(data: Dict, paths: List[List[str]]) -> str:
   for path in paths:
     current = data
     for key in path:
@@ -331,7 +582,7 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
 
 
 def verify_stripe_signature(raw_body: bytes, signature_header: str) -> None:
-  secret = (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
+  secret = get_stripe_webhook_secret()
   if not secret:
     return
   timestamp = ""
@@ -495,6 +746,80 @@ async def list_public_templates():
   return {"products": [serialize_template_product(row) for row in rows]}
 
 
+@app.post("/api/templates/checkout")
+async def create_template_checkout(payload: TemplateCheckoutRequest, request: Request):
+  product_slug = normalize_template_slug(payload.product_slug)
+  with get_db_conn() as conn:
+    product = conn.execute(
+      "SELECT * FROM template_products WHERE slug = ? AND active = 1",
+      (product_slug,),
+    ).fetchone()
+  if not product:
+    raise HTTPException(status_code=404, detail="Template pack not found")
+  if product["price"].strip().lower() == "free":
+    raise HTTPException(status_code=400, detail="Free packs do not require checkout")
+
+  fallback_origin = request.headers.get("origin") or ""
+  success_url = validate_checkout_url(payload.success_url, fallback_origin)
+  cancel_url = validate_checkout_url(payload.cancel_url, fallback_origin)
+  checkout_url = stripe_checkout_session(
+    product,
+    success_url,
+    cancel_url,
+    payload.customer_first_name,
+    payload.customer_last_name,
+    payload.customer_email,
+  )
+  return {"provider": "stripe", "checkout_url": checkout_url}
+
+
+@app.get("/api/admin/payment-settings")
+async def get_admin_payment_settings(request: Request):
+  require_admin(request)
+  with get_db_conn() as conn:
+    rows = conn.execute("SELECT key, encrypted_value, updated_at FROM payment_settings").fetchall()
+  by_key = {row["key"]: row for row in rows}
+  return {
+    "encryption_configured": len(PAYMENT_CONFIG_SECRET.strip()) >= 32,
+    "settings": {
+      key: serialize_payment_setting(
+        key,
+        by_key[key]["encrypted_value"] if key in by_key else None,
+        by_key[key]["updated_at"] if key in by_key else None,
+      )
+      for key in sorted(PAYMENT_SETTING_KEYS)
+    },
+  }
+
+
+@app.post("/api/admin/payment-settings")
+async def save_admin_payment_settings(payload: PaymentSettingsUpdate, request: Request):
+  require_admin(request)
+  updates = payload.dict()
+  clean_updates = {
+    key: value.strip()
+    for key, value in updates.items()
+    if key in PAYMENT_SETTING_KEYS and isinstance(value, str) and value.strip()
+  }
+  if not clean_updates:
+    raise HTTPException(status_code=400, detail="Enter at least one payment setting to save")
+
+  with get_db_conn() as conn:
+    for key, value in clean_updates.items():
+      conn.execute(
+        """
+        INSERT INTO payment_settings (key, encrypted_value, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          encrypted_value = excluded.encrypted_value,
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (key, encrypt_payment_value(value)),
+      )
+    conn.commit()
+  return await get_admin_payment_settings(request)
+
+
 @app.get("/api/admin/templates")
 async def list_admin_templates(request: Request):
   require_admin(request)
@@ -599,7 +924,7 @@ async def stripe_webhook(request: Request):
   except json.JSONDecodeError:
     raise HTTPException(status_code=400, detail="Invalid JSON")
   event_type = event.get("type", "")
-  if event_type not in {"checkout.session.completed", "payment_intent.succeeded"}:
+  if event_type != "checkout.session.completed":
     return {"ok": True, "ignored": True}
   data_object = (event.get("data") or {}).get("object") or {}
   metadata = data_object.get("metadata") or {}
@@ -747,3 +1072,4 @@ async def transcribe(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
   return {"ok": True}
+
