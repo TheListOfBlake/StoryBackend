@@ -161,6 +161,12 @@ PAYMENT_SETTING_KEYS = {
 }
 
 
+DEFAULT_R2_DOWNLOAD_URLS = {
+  f"month-{index}-pack": f"https://media.storytimecaptions.com/Month%20{index}.zip"
+  for index in range(1, 13)
+}
+
+
 DEFAULT_TEMPLATE_PRODUCTS = [
   {
     "slug": "free-pack",
@@ -186,6 +192,7 @@ DEFAULT_TEMPLATE_PRODUCTS = [
       "old_price": "",
       "price": "$14.99",
       "badge": "Instant Download • Commercial Use",
+      "r2_download_url": DEFAULT_R2_DOWNLOAD_URLS[f"month-{index}-pack"],
     }
     for index in range(1, 13)
   ],
@@ -272,8 +279,8 @@ def init_db() -> None:
         conn.execute(
           """
           INSERT INTO template_products (
-            slug, name, description, old_price, price, badge, sort_order
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            slug, name, description, old_price, price, badge, r2_download_url, sort_order
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           """,
           (
             product["slug"],
@@ -282,9 +289,19 @@ def init_db() -> None:
             product["old_price"],
             product["price"],
             product["badge"],
+            product.get("r2_download_url", ""),
             sort_order,
           ),
         )
+    for slug, download_url in DEFAULT_R2_DOWNLOAD_URLS.items():
+      conn.execute(
+        """
+        UPDATE template_products
+        SET r2_download_url = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE slug = ? AND (r2_download_url IS NULL OR r2_download_url = '')
+        """,
+        (download_url, slug),
+      )
     conn.commit()
 
 
