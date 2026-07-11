@@ -882,7 +882,6 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
     )
     conn.commit()
   if cursor.rowcount > 0:
-    send_template_download_email(clean_slug, clean_email)
     return int(cursor.lastrowid)
   return None
 
