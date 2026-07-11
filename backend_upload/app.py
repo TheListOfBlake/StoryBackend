@@ -568,6 +568,20 @@ def serialize_template_product(row: sqlite3.Row, include_private: bool = False) 
   return product
 
 
+def serialize_template_purchase(row: sqlite3.Row) -> dict:
+  return {
+    "id": int(row["id"]),
+    "provider": row["provider"],
+    "provider_event_id": row["provider_event_id"],
+    "provider_payment_id": row["provider_payment_id"],
+    "product_slug": row["product_slug"],
+    "product_name": row["product_name"] or row["product_slug"],
+    "product_price": row["product_price"] or "",
+    "customer_email": row["customer_email"],
+    "created_at": row["created_at"],
+  }
+
+
 def get_template_by_slug(slug: str):
   with get_db_conn() as conn:
     return conn.execute("SELECT * FROM template_products WHERE slug = ?", (slug,)).fetchone()
@@ -939,6 +953,31 @@ async def list_admin_templates(request: Request):
   with get_db_conn() as conn:
     rows = conn.execute("SELECT * FROM template_products ORDER BY sort_order ASC, id ASC").fetchall()
   return {"products": [serialize_template_product(row, include_private=True) for row in rows]}
+
+
+@app.get("/api/admin/template-purchases")
+async def list_admin_template_purchases(request: Request):
+  require_admin(request)
+  with get_db_conn() as conn:
+    rows = conn.execute(
+      """
+      SELECT
+        template_purchases.id,
+        template_purchases.provider,
+        template_purchases.provider_event_id,
+        template_purchases.provider_payment_id,
+        template_purchases.product_slug,
+        template_purchases.customer_email,
+        template_purchases.created_at,
+        template_products.name AS product_name,
+        template_products.price AS product_price
+      FROM template_purchases
+      LEFT JOIN template_products ON template_products.slug = template_purchases.product_slug
+      ORDER BY datetime(template_purchases.created_at) DESC, template_purchases.id DESC
+      LIMIT 500
+      """
+    ).fetchall()
+  return {"purchases": [serialize_template_purchase(row) for row in rows]}
 
 
 @app.post("/api/admin/templates")
