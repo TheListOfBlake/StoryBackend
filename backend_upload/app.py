@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
+from starlette.responses import RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 from vosk import KaldiRecognizer, Model
 
@@ -50,6 +52,9 @@ SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME).strip()
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Storytime Captions").strip()
+PUBLIC_BACKEND_URL = os.environ.get("PUBLIC_BACKEND_URL", "").strip().rstrip("/")
+DOWNLOAD_TOKEN_MAX_DOWNLOADS = int(os.environ.get("DOWNLOAD_TOKEN_MAX_DOWNLOADS", "3"))
+DOWNLOAD_TOKEN_EXPIRES_HOURS = int(os.environ.get("DOWNLOAD_TOKEN_EXPIRES_HOURS", "24"))
 
 app = FastAPI()
 
@@ -153,6 +158,10 @@ class TemplateCheckoutRequest(BaseModel):
   customer_email: str = ""
   success_url: str
   cancel_url: str
+
+
+class TemplateCheckoutSessionDownloadRequest(BaseModel):
+  session_id: str
 
 
 class PaymentSettingsUpdate(BaseModel):
@@ -272,6 +281,22 @@ def init_db() -> None:
         customer_email TEXT NOT NULL,
         raw_event TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+      """
+    )
+    conn.execute(
+      """
+      CREATE TABLE IF NOT EXISTS template_purchase_downloads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_id INTEGER NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        link_name TEXT NOT NULL,
+        download_url TEXT NOT NULL,
+        download_count INTEGER NOT NULL DEFAULT 0,
+        max_downloads INTEGER NOT NULL DEFAULT 3,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(purchase_id) REFERENCES template_purchases(id)
       )
       """
     )
@@ -579,6 +604,9 @@ def serialize_template_purchase(row: sqlite3.Row) -> dict:
     "product_price": row["product_price"] or "",
     "customer_email": row["customer_email"],
     "created_at": row["created_at"],
+    "download_count": int(row["download_count"] or 0),
+    "max_downloads": int(row["max_downloads"] or 0),
+    "latest_download_expires_at": row["latest_download_expires_at"] or "",
   }
 
 
@@ -620,12 +648,149 @@ def get_template_download_links(product_slug: str) -> List[dict]:
   return [{"name": row["name"], "url": row["r2_download_url"]}]
 
 
+def utc_now() -> datetime:
+  return datetime.utcnow()
+
+
+def format_db_time(value: datetime) -> str:
+  return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_download_base_url(request: Optional[Request] = None) -> str:
+  if PUBLIC_BACKEND_URL:
+    return PUBLIC_BACKEND_URL
+  if request:
+    return str(request.base_url).rstrip("/")
+  return ""
+
+
+def create_download_tokens_for_purchase(purchase_id: int, product_slug: str, request: Optional[Request] = None) -> List[dict]:
+  links = get_template_download_links(product_slug)
+  if not links:
+    return []
+  expires_at = format_db_time(utc_now() + timedelta(hours=DOWNLOAD_TOKEN_EXPIRES_HOURS))
+  base_url = get_download_base_url(request)
+  with get_db_conn() as conn:
+    token_links = []
+    for link in links:
+      token = secrets.token_urlsafe(32)
+      conn.execute(
+        """
+        INSERT INTO template_purchase_downloads (
+          purchase_id, token, link_name, download_url, max_downloads, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (purchase_id, token, link["name"], link["url"], DOWNLOAD_TOKEN_MAX_DOWNLOADS, expires_at),
+      )
+      token_url = f"{base_url}/api/templates/redeem-download/{token}" if base_url else f"/api/templates/redeem-download/{token}"
+      token_links.append(
+        {
+          "name": link["name"],
+          "url": token_url,
+          "expires_at": expires_at,
+          "downloads_remaining": DOWNLOAD_TOKEN_MAX_DOWNLOADS,
+        }
+      )
+    conn.commit()
+  return token_links
+
+
+def get_existing_valid_download_tokens(purchase_id: int, request: Optional[Request] = None) -> List[dict]:
+  base_url = get_download_base_url(request)
+  now = format_db_time(utc_now())
+  with get_db_conn() as conn:
+    rows = conn.execute(
+      """
+      SELECT token, link_name, download_count, max_downloads, expires_at
+      FROM template_purchase_downloads
+      WHERE purchase_id = ?
+        AND download_count < max_downloads
+        AND expires_at > ?
+      ORDER BY id ASC
+      """,
+      (purchase_id, now),
+    ).fetchall()
+  return [
+    {
+      "name": row["link_name"],
+      "url": f"{base_url}/api/templates/redeem-download/{row['token']}" if base_url else f"/api/templates/redeem-download/{row['token']}",
+      "expires_at": row["expires_at"],
+      "downloads_remaining": int(row["max_downloads"]) - int(row["download_count"]),
+    }
+    for row in rows
+  ]
+
+
+def get_or_create_download_tokens(purchase_id: int, product_slug: str, request: Optional[Request] = None) -> List[dict]:
+  existing = get_existing_valid_download_tokens(purchase_id, request)
+  if existing:
+    return existing
+  return create_download_tokens_for_purchase(purchase_id, product_slug, request)
+
+
+def get_purchase_for_session(provider: str, session_id: str):
+  with get_db_conn() as conn:
+    return conn.execute(
+      """
+      SELECT * FROM template_purchases
+      WHERE provider = ? AND provider_payment_id = ?
+      ORDER BY datetime(created_at) DESC, id DESC
+      LIMIT 1
+      """,
+      (provider, session_id),
+    ).fetchone()
+
+
+def get_purchase_for_email(product_slug: str, email: str):
+  with get_db_conn() as conn:
+    return conn.execute(
+      """
+      SELECT * FROM template_purchases
+      WHERE product_slug = ? AND lower(customer_email) = ?
+      ORDER BY datetime(created_at) DESC, id DESC
+      LIMIT 1
+      """,
+      (product_slug, email),
+    ).fetchone()
+
+
+def verify_stripe_checkout_session(session_id: str) -> dict:
+  clean_session_id = (session_id or "").strip()
+  if not clean_session_id.startswith("cs_"):
+    raise HTTPException(status_code=400, detail="Invalid checkout session")
+  secret_key = get_stripe_secret_key()
+  if not secret_key:
+    raise HTTPException(status_code=500, detail="Stripe secret key is not configured")
+  request = urllib.request.Request(
+    f"https://api.stripe.com/v1/checkout/sessions/{urllib.parse.quote(clean_session_id)}",
+    headers={"Authorization": f"Bearer {secret_key}"},
+    method="GET",
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+      session = json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as exc:
+    if exc.code == 404:
+      raise HTTPException(status_code=404, detail="Checkout session not found")
+    raise HTTPException(status_code=502, detail="Unable to verify Stripe checkout session")
+  except urllib.error.URLError:
+    raise HTTPException(status_code=502, detail="Unable to reach Stripe checkout service")
+
+  if session.get("payment_status") != "paid":
+    raise HTTPException(status_code=402, detail="Payment is not completed")
+  return session
+
+
 def send_template_download_email(product_slug: str, email: str) -> None:
   if not SMTP_HOST or not SMTP_FROM_EMAIL:
     return
 
-  links = get_template_download_links(product_slug)
-  if not links:
+  purchase = get_purchase_for_email(normalize_template_slug(product_slug), email.strip().lower())
+  if not purchase:
+    return
+
+  links = get_or_create_download_tokens(int(purchase["id"]), product_slug)
+  if not links or any(str(link["url"]).startswith("/") for link in links):
     return
 
   clean_email = email.strip().lower()
@@ -687,7 +852,7 @@ def extract_nested_value(data: Dict, paths: List[List[str]]) -> str:
   return ""
 
 
-def record_template_purchase(provider: str, event_id: str, payment_id: str, product_slug: str, email: str, raw_event: dict) -> None:
+def record_template_purchase(provider: str, event_id: str, payment_id: str, product_slug: str, email: str, raw_event: dict) -> Optional[int]:
   clean_slug = normalize_template_slug(product_slug)
   clean_email = (email or "").strip().lower()
   if not clean_email or "@" not in clean_email:
@@ -695,6 +860,18 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
   if not get_template_by_slug(clean_slug):
     raise HTTPException(status_code=400, detail="Webhook referenced an unknown template")
   with get_db_conn() as conn:
+    existing = None
+    if payment_id:
+      existing = conn.execute(
+        """
+        SELECT id FROM template_purchases
+        WHERE provider = ? AND provider_payment_id = ?
+        LIMIT 1
+        """,
+        (provider, payment_id),
+      ).fetchone()
+    if existing:
+      return int(existing["id"])
     cursor = conn.execute(
       """
       INSERT OR IGNORE INTO template_purchases (
@@ -706,6 +883,8 @@ def record_template_purchase(provider: str, event_id: str, payment_id: str, prod
     conn.commit()
   if cursor.rowcount > 0:
     send_template_download_email(clean_slug, clean_email)
+    return int(cursor.lastrowid)
+  return None
 
 
 def verify_stripe_signature(raw_body: bytes, signature_header: str) -> None:
@@ -970,9 +1149,21 @@ async def list_admin_template_purchases(request: Request):
         template_purchases.customer_email,
         template_purchases.created_at,
         template_products.name AS product_name,
-        template_products.price AS product_price
+        template_products.price AS product_price,
+        COALESCE(download_stats.download_count, 0) AS download_count,
+        COALESCE(download_stats.max_downloads, 0) AS max_downloads,
+        COALESCE(download_stats.latest_download_expires_at, '') AS latest_download_expires_at
       FROM template_purchases
       LEFT JOIN template_products ON template_products.slug = template_purchases.product_slug
+      LEFT JOIN (
+        SELECT
+          purchase_id,
+          SUM(download_count) AS download_count,
+          SUM(max_downloads) AS max_downloads,
+          MAX(expires_at) AS latest_download_expires_at
+        FROM template_purchase_downloads
+        GROUP BY purchase_id
+      ) AS download_stats ON download_stats.purchase_id = template_purchases.id
       ORDER BY datetime(template_purchases.created_at) DESC, template_purchases.id DESC
       LIMIT 500
       """
@@ -1041,30 +1232,96 @@ async def save_admin_templates(payload: TemplateBulkUpdate, request: Request):
 
 
 @app.post("/api/templates/download")
-async def get_template_download(payload: TemplateDownloadRequest):
+async def get_template_download(payload: TemplateDownloadRequest, request: Request):
   product_slug = normalize_template_slug(payload.product_slug)
   email = payload.email.strip().lower()
   if not email or "@" not in email:
     raise HTTPException(status_code=400, detail="Enter the purchase email")
-  with get_db_conn() as conn:
-    purchase = conn.execute(
-      """
-      SELECT id FROM template_purchases
-      WHERE product_slug = ? AND lower(customer_email) = ?
-      ORDER BY datetime(created_at) DESC, id DESC
-      LIMIT 1
-      """,
-      (product_slug, email),
-    ).fetchone()
-    if not purchase:
-      raise HTTPException(status_code=404, detail="No completed purchase found for that email")
-  links = get_template_download_links(product_slug)
+  purchase = get_purchase_for_email(product_slug, email)
+  if not purchase:
+    raise HTTPException(status_code=404, detail="No completed purchase found for that email")
+  links = get_or_create_download_tokens(int(purchase["id"]), product_slug, request)
   if not links:
     raise HTTPException(status_code=404, detail="Download is not configured yet")
   response = {"download_links": links}
   if len(links) == 1:
     response["download_url"] = links[0]["url"]
   return response
+
+
+@app.post("/api/templates/checkout-session-download")
+async def get_template_checkout_session_download(payload: TemplateCheckoutSessionDownloadRequest, request: Request):
+  session = verify_stripe_checkout_session(payload.session_id)
+  metadata = session.get("metadata") or {}
+  product_slug = metadata.get("template_slug") or metadata.get("product_slug") or metadata.get("slug") or ""
+  clean_slug = normalize_template_slug(product_slug)
+  email = (
+    session.get("customer_email")
+    or session.get("receipt_email")
+    or extract_nested_value(session, [["customer_details", "email"], ["billing_details", "email"]])
+  )
+  session_id = str(session.get("id") or payload.session_id)
+  purchase = get_purchase_for_session("stripe", session_id)
+  if not purchase:
+    purchase_id = record_template_purchase(
+      "stripe",
+      f"stripe-session-{session_id}",
+      session_id,
+      clean_slug,
+      email,
+      session,
+    )
+    if not purchase_id:
+      purchase = get_purchase_for_session("stripe", session_id)
+      purchase_id = int(purchase["id"]) if purchase else 0
+  else:
+    purchase_id = int(purchase["id"])
+  if not purchase_id:
+    raise HTTPException(status_code=404, detail="Completed purchase could not be recorded")
+  links = get_or_create_download_tokens(purchase_id, clean_slug, request)
+  if not links:
+    raise HTTPException(status_code=404, detail="Download is not configured yet")
+  return {
+    "ok": True,
+    "product_slug": clean_slug,
+    "customer_email": (email or "").strip().lower(),
+    "download_links": links,
+  }
+
+
+@app.get("/api/templates/redeem-download/{token}")
+async def redeem_template_download(token: str):
+  clean_token = (token or "").strip()
+  if len(clean_token) < 20:
+    raise HTTPException(status_code=404, detail="Download link not found")
+  now = format_db_time(utc_now())
+  with get_db_conn() as conn:
+    row = conn.execute(
+      """
+      SELECT id, download_url, download_count, max_downloads, expires_at
+      FROM template_purchase_downloads
+      WHERE token = ?
+      LIMIT 1
+      """,
+      (clean_token,),
+    ).fetchone()
+    if not row:
+      raise HTTPException(status_code=404, detail="Download link not found")
+    if row["expires_at"] <= now:
+      raise HTTPException(status_code=410, detail="Download link expired")
+    if int(row["download_count"]) >= int(row["max_downloads"]):
+      raise HTTPException(status_code=429, detail="Download limit reached")
+    conn.execute(
+      """
+      UPDATE template_purchase_downloads
+      SET download_count = download_count + 1
+      WHERE id = ?
+      """,
+      (int(row["id"]),),
+    )
+    conn.commit()
+    download_url = row["download_url"]
+  return RedirectResponse(download_url, status_code=302)
 
 
 @app.post("/webhooks/stripe")
@@ -1086,7 +1343,7 @@ async def stripe_webhook(request: Request):
     or data_object.get("receipt_email")
     or extract_nested_value(data_object, [["customer_details", "email"], ["billing_details", "email"]])
   )
-  payment_id = str(data_object.get("payment_intent") or data_object.get("id") or "")
+  payment_id = str(data_object.get("id") or data_object.get("payment_intent") or "")
   record_template_purchase("stripe", str(event.get("id") or payment_id), payment_id, product_slug, email, event)
   return {"ok": True}
 
