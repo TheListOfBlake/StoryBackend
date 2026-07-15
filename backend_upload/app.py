@@ -164,6 +164,10 @@ class TemplateCheckoutSessionDownloadRequest(BaseModel):
   session_id: str
 
 
+class PayPalCaptureOrderRequest(BaseModel):
+  order_id: str
+
+
 class PaymentSettingsUpdate(BaseModel):
   stripe_secret_key: Optional[str] = None
   stripe_webhook_secret: Optional[str] = None
@@ -475,6 +479,28 @@ def get_stripe_webhook_secret() -> str:
   return saved or (os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
 
 
+def get_paypal_client_id() -> str:
+  saved = get_payment_setting_value("paypal_client_id")
+  return saved or (os.environ.get("PAYPAL_CLIENT_ID") or "").strip()
+
+
+def get_paypal_client_secret() -> str:
+  saved = get_payment_setting_value("paypal_client_secret")
+  return saved or (os.environ.get("PAYPAL_CLIENT_SECRET") or "").strip()
+
+
+def get_paypal_webhook_id() -> str:
+  saved = get_payment_setting_value("paypal_webhook_id")
+  return saved or (os.environ.get("PAYPAL_WEBHOOK_ID") or "").strip()
+
+
+def get_paypal_base_url() -> str:
+  env = (os.environ.get("PAYPAL_ENV") or "live").strip().lower()
+  if env in {"sandbox", "test"}:
+    return "https://api-m.sandbox.paypal.com"
+  return "https://api-m.paypal.com"
+
+
 def parse_price_cents(price: str) -> int:
   clean = (price or "").strip().replace("$", "").replace(",", "")
   try:
@@ -484,6 +510,11 @@ def parse_price_cents(price: str) -> int:
   if amount < 50:
     raise HTTPException(status_code=400, detail="Product price is too low for checkout")
   return int(amount)
+
+
+def parse_price_value(price: str) -> str:
+  cents = parse_price_cents(price)
+  return f"{cents / 100:.2f}"
 
 
 def validate_checkout_url(value: str, fallback_origin: str) -> str:
@@ -565,6 +596,132 @@ def stripe_checkout_session(
   if not checkout_url:
     raise HTTPException(status_code=502, detail="Stripe did not return a checkout URL")
   return str(checkout_url)
+
+
+def paypal_access_token() -> str:
+  client_id = get_paypal_client_id()
+  client_secret = get_paypal_client_secret()
+  if not client_id or not client_secret:
+    raise HTTPException(status_code=500, detail="PayPal client ID and secret are not configured")
+  credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
+  encoded = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+  request = urllib.request.Request(
+    f"{get_paypal_base_url()}/v1/oauth2/token",
+    data=encoded,
+    headers={
+      "Authorization": f"Basic {credentials}",
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    method="POST",
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+      payload = json.loads(response.read().decode("utf-8"))
+  except urllib.error.HTTPError as exc:
+    error_body = exc.read().decode("utf-8", errors="ignore")
+    try:
+      error_payload = json.loads(error_body)
+      message = error_payload.get("error_description") or error_payload.get("message") or "PayPal rejected authentication"
+    except json.JSONDecodeError:
+      message = "PayPal rejected authentication"
+    raise HTTPException(status_code=502, detail=message)
+  except urllib.error.URLError:
+    raise HTTPException(status_code=502, detail="Unable to reach PayPal authentication service")
+  token = payload.get("access_token")
+  if not token:
+    raise HTTPException(status_code=502, detail="PayPal did not return an access token")
+  return str(token)
+
+
+def paypal_api_request(path: str, method: str = "GET", payload: Optional[dict] = None) -> dict:
+  token = paypal_access_token()
+  data = json.dumps(payload).encode("utf-8") if payload is not None else None
+  request = urllib.request.Request(
+    f"{get_paypal_base_url()}{path}",
+    data=data,
+    headers={
+      "Authorization": f"Bearer {token}",
+      "Content-Type": "application/json",
+    },
+    method=method,
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=25) as response:
+      body = response.read().decode("utf-8")
+      return json.loads(body) if body else {}
+  except urllib.error.HTTPError as exc:
+    error_body = exc.read().decode("utf-8", errors="ignore")
+    try:
+      error_payload = json.loads(error_body)
+      details = error_payload.get("details") or []
+      message = (
+        error_payload.get("message")
+        or (details[0].get("description") if details and isinstance(details[0], dict) else "")
+        or "PayPal rejected the request"
+      )
+    except json.JSONDecodeError:
+      message = "PayPal rejected the request"
+    raise HTTPException(status_code=502, detail=message)
+  except urllib.error.URLError:
+    raise HTTPException(status_code=502, detail="Unable to reach PayPal service")
+
+
+def paypal_create_order(
+  product: sqlite3.Row,
+  return_url: str,
+  cancel_url: str,
+  customer_first_name: str = "",
+  customer_last_name: str = "",
+  customer_email: str = "",
+) -> str:
+  first_name = customer_first_name.strip()
+  if not first_name:
+    raise HTTPException(status_code=400, detail="First name is required")
+  clean_email = customer_email.strip().lower()
+  if not clean_email or "@" not in clean_email:
+    raise HTTPException(status_code=400, detail="Enter a valid email address")
+  product_slug = product["slug"]
+  payload = {
+    "intent": "CAPTURE",
+    "purchase_units": [
+      {
+        "custom_id": product_slug,
+        "description": product["description"] or product["badge"] or product["name"],
+        "amount": {
+          "currency_code": "USD",
+          "value": parse_price_value(product["price"]),
+        },
+      }
+    ],
+    "payment_source": {
+      "paypal": {
+        "experience_context": {
+          "payment_method_preference": "IMMEDIATE_PAYMENT_REQUIRED",
+          "brand_name": "Storytime Captions",
+          "landing_page": "LOGIN",
+          "shipping_preference": "NO_SHIPPING",
+          "user_action": "PAY_NOW",
+          "return_url": return_url,
+          "cancel_url": cancel_url,
+        }
+      }
+    },
+  }
+  order = paypal_api_request("/v2/checkout/orders", method="POST", payload=payload)
+  links = order.get("links") or []
+  approve_url = next((link.get("href") for link in links if link.get("rel") == "payer-action"), "")
+  if not approve_url:
+    approve_url = next((link.get("href") for link in links if link.get("rel") == "approve"), "")
+  if not approve_url:
+    raise HTTPException(status_code=502, detail="PayPal did not return an approval URL")
+  return str(approve_url)
+
+
+def paypal_capture_order(order_id: str) -> dict:
+  clean_order_id = (order_id or "").strip()
+  if not clean_order_id:
+    raise HTTPException(status_code=400, detail="PayPal order ID is required")
+  return paypal_api_request(f"/v2/checkout/orders/{urllib.parse.quote(clean_order_id)}/capture", method="POST", payload={})
 
 
 def normalize_template_slug(value: str) -> str:
@@ -1078,6 +1235,33 @@ async def create_template_checkout(payload: TemplateCheckoutRequest, request: Re
   return {"provider": "stripe", "checkout_url": checkout_url}
 
 
+@app.post("/api/templates/paypal/create-order")
+async def create_template_paypal_order(payload: TemplateCheckoutRequest, request: Request):
+  product_slug = normalize_template_slug(payload.product_slug)
+  with get_db_conn() as conn:
+    product = conn.execute(
+      "SELECT * FROM template_products WHERE slug = ? AND active = 1",
+      (product_slug,),
+    ).fetchone()
+  if not product:
+    raise HTTPException(status_code=404, detail="Template pack not found")
+  if product["price"].strip().lower() == "free":
+    raise HTTPException(status_code=400, detail="Free packs do not require checkout")
+
+  fallback_origin = request.headers.get("origin") or ""
+  success_url = validate_checkout_url(payload.success_url, fallback_origin)
+  cancel_url = validate_checkout_url(payload.cancel_url, fallback_origin)
+  checkout_url = paypal_create_order(
+    product,
+    success_url,
+    cancel_url,
+    payload.customer_first_name,
+    payload.customer_last_name,
+    payload.customer_email,
+  )
+  return {"provider": "paypal", "checkout_url": checkout_url}
+
+
 @app.get("/api/admin/payment-settings")
 async def get_admin_payment_settings(request: Request):
   require_admin(request)
@@ -1288,6 +1472,55 @@ async def get_template_checkout_session_download(payload: TemplateCheckoutSessio
   }
 
 
+@app.post("/api/templates/paypal/capture-order")
+async def capture_template_paypal_order(payload: PayPalCaptureOrderRequest, request: Request):
+  capture = paypal_capture_order(payload.order_id)
+  status = str(capture.get("status") or "").upper()
+  if status != "COMPLETED":
+    raise HTTPException(status_code=402, detail="PayPal payment is not completed")
+  purchase_units = capture.get("purchase_units") or []
+  first_unit = purchase_units[0] if purchase_units else {}
+  payments = first_unit.get("payments") or {}
+  captures = payments.get("captures") or []
+  first_capture = captures[0] if captures else {}
+  product_slug = (
+    first_capture.get("custom_id")
+    or first_unit.get("custom_id")
+    or first_unit.get("invoice_id")
+    or ""
+  )
+  clean_slug = normalize_template_slug(product_slug)
+  email = extract_nested_value(capture, [["payer", "email_address"]])
+  payment_id = str(first_capture.get("id") or capture.get("id") or payload.order_id)
+  purchase = get_purchase_for_session("paypal", payment_id)
+  if not purchase:
+    purchase_id = record_template_purchase(
+      "paypal",
+      f"paypal-capture-{payment_id}",
+      payment_id,
+      clean_slug,
+      email,
+      capture,
+    )
+    if not purchase_id:
+      purchase = get_purchase_for_session("paypal", payment_id)
+      purchase_id = int(purchase["id"]) if purchase else 0
+  else:
+    purchase_id = int(purchase["id"])
+  if not purchase_id:
+    raise HTTPException(status_code=404, detail="Completed PayPal purchase could not be recorded")
+  links = get_or_create_download_tokens(purchase_id, clean_slug, request)
+  if not links:
+    raise HTTPException(status_code=404, detail="Download is not configured yet")
+  return {
+    "ok": True,
+    "provider": "paypal",
+    "product_slug": clean_slug,
+    "customer_email": email.strip().lower(),
+    "download_links": links,
+  }
+
+
 @app.get("/api/templates/redeem-download/{token}")
 async def redeem_template_download(token: str):
   clean_token = (token or "").strip()
@@ -1355,7 +1588,7 @@ async def paypal_webhook(request: Request):
   except json.JSONDecodeError:
     raise HTTPException(status_code=400, detail="Invalid JSON")
   event_type = event.get("event_type", "")
-  if event_type and event_type not in {"CHECKOUT.ORDER.APPROVED", "PAYMENT.CAPTURE.COMPLETED"}:
+  if event_type and event_type != "PAYMENT.CAPTURE.COMPLETED":
     return {"ok": True, "ignored": True}
   resource = event.get("resource") or {}
   product_slug = (
