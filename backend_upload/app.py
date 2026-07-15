@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import base64
@@ -206,7 +206,7 @@ DEFAULT_TEMPLATE_PRODUCTS = [
     "description": "Commercial use template bundle with 12 monthly packs.",
     "old_price": "$179.99",
     "price": "$99.99",
-    "badge": "Save 44% • Instant Download • Commercial Use • 12 Monthly Packs",
+    "badge": "Save 44% • Instant Download • 12 Monthly Packs",
   },
   *[
     {
@@ -215,7 +215,7 @@ DEFAULT_TEMPLATE_PRODUCTS = [
       "description": "Monthly story template pack.",
       "old_price": "",
       "price": "$14.99",
-      "badge": "Instant Download • Commercial Use",
+      "badge": "Instant Download",
       "r2_download_url": DEFAULT_R2_DOWNLOAD_URLS[f"month-{index}-pack"],
     }
     for index in range(1, 13)
@@ -342,6 +342,14 @@ def init_db() -> None:
         """,
         (download_url, slug),
       )
+    conn.execute(
+      """
+      UPDATE template_products
+      SET badge = REPLACE(badge, ' • Commercial Use', ''),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE badge LIKE '%Commercial Use%'
+      """
+    )
     conn.commit()
 
 
@@ -1713,4 +1721,5 @@ async def transcribe(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
   return {"ok": True}
+
 
